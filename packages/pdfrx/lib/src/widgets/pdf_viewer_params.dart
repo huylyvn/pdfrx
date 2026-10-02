@@ -54,6 +54,7 @@ class PdfViewerParams {
     this.pageDropShadow = const BoxShadow(color: Colors.black54, blurRadius: 4, spreadRadius: 2, offset: Offset(2, 2)),
     this.panEnabled = true,
     this.scaleEnabled = true,
+    this.scaleInertiaEnabled = true,
     this.onInteractionEnd,
     this.onInteractionStart,
     this.onInteractionUpdate,
@@ -297,6 +298,15 @@ class PdfViewerParams {
 
   /// See [InteractiveViewer.scaleEnabled] for details.
   final bool scaleEnabled;
+
+  /// Whether a pinch/scaling gesture may start a post-release scale inertia
+  /// ("scale fling") animation. Defaults to true (pdfrx's existing behaviour).
+  ///
+  /// Set to false to keep the scale exactly where the gesture left it, which
+  /// prevents the large unintended post-release zoom excursion to `minScale`
+  /// an unbounded fling target can produce on a fast pinch.
+  /// Pan inertia is not affected.
+  final bool scaleInertiaEnabled;
 
   /// See [InteractiveViewer.onInteractionEnd] for details.
   final GestureScaleEndCallback? onInteractionEnd;
@@ -786,6 +796,7 @@ class PdfViewerParams {
         other.pageDropShadow == pageDropShadow &&
         other.panEnabled == panEnabled &&
         other.scaleEnabled == scaleEnabled &&
+        other.scaleInertiaEnabled == scaleInertiaEnabled &&
         other.onInteractionEnd == onInteractionEnd &&
         other.onInteractionStart == onInteractionStart &&
         other.onInteractionUpdate == onInteractionUpdate &&
@@ -857,6 +868,7 @@ class PdfViewerParams {
         pageDropShadow.hashCode ^
         panEnabled.hashCode ^
         scaleEnabled.hashCode ^
+        scaleInertiaEnabled.hashCode ^
         onInteractionEnd.hashCode ^
         onInteractionStart.hashCode ^
         onInteractionUpdate.hashCode ^

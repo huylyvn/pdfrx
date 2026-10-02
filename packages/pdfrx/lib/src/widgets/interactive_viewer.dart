@@ -78,6 +78,7 @@ class InteractiveViewer extends StatefulWidget {
     this.onInteractionUpdate,
     this.panEnabled = true,
     this.scaleEnabled = true,
+    this.scaleInertiaEnabled = true,
     this.scaleFactor = kDefaultMouseScrollToScaleFactor,
     this.transformationController,
     this.alignment,
@@ -127,6 +128,7 @@ class InteractiveViewer extends StatefulWidget {
     this.onInteractionUpdate,
     this.panEnabled = true,
     this.scaleEnabled = true,
+    this.scaleInertiaEnabled = true,
     this.scaleFactor = 200.0,
     this.transformationController,
     this.alignment,
@@ -261,6 +263,19 @@ class InteractiveViewer extends StatefulWidget {
   ///
   ///   * [panEnabled], which is similar but for panning.
   final bool scaleEnabled;
+
+  /// Whether a pinch/scaling gesture may start a post-release **scale inertia**
+  /// ("scale fling") animation.
+  ///
+  /// Defaults to true, preserving pdfrx's existing behaviour.
+  ///
+  /// When false, ending a scale gesture leaves the scale exactly where the
+  /// gesture left it. The fling's target (`frictionSimulation.x(tFinal)`) is
+  /// unbounded, so when it falls below `minScale` the per-tick clamp in
+  /// `_matrixScale` pins the viewer to the floor — visible as a large
+  /// unintended zoom excursion to `minScale` after a fast pinch.
+  /// Pan inertia is unaffected by this flag.
+  final bool scaleInertiaEnabled;
 
   /// {@macro flutter.gestures.scale.trackpadScrollCausesScale}
   final bool trackpadScrollCausesScale;
@@ -1053,6 +1068,10 @@ class InteractiveViewerState extends State<InteractiveViewer> with TickerProvide
             });
           break;
         } else {
+          if (!widget.scaleInertiaEnabled) {
+            _currentAxis = null;
+            return;
+          }
           if (details.scaleVelocity.abs() < 0.1) {
             _currentAxis = null;
             return;
