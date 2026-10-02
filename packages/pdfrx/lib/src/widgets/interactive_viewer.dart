@@ -15,6 +15,7 @@ import 'package:flutter/services.dart';
 import 'package:vector_math/vector_math_64.dart' show Matrix4, Quad, Vector3;
 
 import '../utils/double_extensions.dart';
+import 'scale_inertia.dart';
 
 // Examples can assume:
 // late BuildContext context;
@@ -79,6 +80,8 @@ class InteractiveViewer extends StatefulWidget {
     this.panEnabled = true,
     this.scaleEnabled = true,
     this.scaleInertiaEnabled = true,
+    this.scaleInertiaMaxExcursion,
+    this.scaleGestureSensitivity = 1.0,
     this.scaleFactor = kDefaultMouseScrollToScaleFactor,
     this.transformationController,
     this.alignment,
@@ -90,6 +93,13 @@ class InteractiveViewer extends StatefulWidget {
     this.scrollPhysicsAutoAdjustBoundaries = true,
   }) : assert(minScale > 0),
        assert(interactionEndFrictionCoefficient > 0),
+       assert(scaleGestureSensitivity > 0 && scaleGestureSensitivity.isFinite),
+       assert(
+         scaleInertiaMaxExcursion == null ||
+             (scaleInertiaMaxExcursion > 0 &&
+                 scaleInertiaMaxExcursion < 1 &&
+                 scaleInertiaMaxExcursion.isFinite),
+       ),
        assert(minScale.isFinite),
        assert(maxScale > 0),
        assert(!maxScale.isNaN),
@@ -129,6 +139,8 @@ class InteractiveViewer extends StatefulWidget {
     this.panEnabled = true,
     this.scaleEnabled = true,
     this.scaleInertiaEnabled = true,
+    this.scaleInertiaMaxExcursion,
+    this.scaleGestureSensitivity = 1.0,
     this.scaleFactor = 200.0,
     this.transformationController,
     this.alignment,
@@ -140,6 +152,13 @@ class InteractiveViewer extends StatefulWidget {
     this.scrollPhysicsAutoAdjustBoundaries = true,
   }) : assert(minScale > 0),
        assert(interactionEndFrictionCoefficient > 0),
+       assert(scaleGestureSensitivity > 0 && scaleGestureSensitivity.isFinite),
+       assert(
+         scaleInertiaMaxExcursion == null ||
+             (scaleInertiaMaxExcursion > 0 &&
+                 scaleInertiaMaxExcursion < 1 &&
+                 scaleInertiaMaxExcursion.isFinite),
+       ),
        assert(minScale.isFinite),
        assert(maxScale > 0),
        assert(!maxScale.isNaN),
@@ -276,6 +295,41 @@ class InteractiveViewer extends StatefulWidget {
   /// unintended zoom excursion to `minScale` after a fast pinch.
   /// Pan inertia is unaffected by this flag.
   final bool scaleInertiaEnabled;
+
+  /// The maximum post-release scale-inertia excursion, as a fraction of the
+  /// release scale.
+  ///
+  /// When `null` (the default) the scale fling target is the raw, unbounded
+  /// friction-simulation target, preserving pdfrx's existing behaviour.
+  ///
+  /// When set to a value in `(0, 1)`, the fling target is bounded to
+  /// `releaseScale * (1 - scaleInertiaMaxExcursion) .. releaseScale *
+  /// (1 + scaleInertiaMaxExcursion)` and then clamped to `[minScale,
+  /// maxScale]`. This keeps useful post-release momentum while preventing the
+  /// large unintended zoom excursion a fast pinch can otherwise produce, and it
+  /// is symmetric between pinch-in and pinch-out. Bounding the excursion
+  /// relative to the release scale (rather than an absolute scale delta) keeps
+  /// the feel comparable at every zoom level.
+  ///
+  /// Only affects the branch used when [scrollPhysics] is null. Pan inertia is
+  /// not affected.
+  final double? scaleInertiaMaxExcursion;
+
+  /// Sensitivity of the pinch/scale gesture, applied as an exponent to the
+  /// gesture's scale ratio.
+  ///
+  /// Defaults to `1.0`, which preserves pdfrx's existing behaviour (the scale
+  /// follows the finger spread one-to-one). Values greater than `1.0` make the
+  /// same finger movement produce more zoom — a pinch that spreads the fingers
+  /// by a factor of `r` scales by `r ^ scaleGestureSensitivity` instead of `r`.
+  /// Because it is an exponent, the amplification is symmetric between pinch-in
+  /// and pinch-out and is comparable at every zoom level.
+  ///
+  /// Affects only the two-finger pinch path ([GestureDetector]'s scale gesture).
+  /// Mouse wheel, trackpad scroll, pointer-scale events, buttons and
+  /// programmatic zoom are unaffected, as is the post-release fling magnitude
+  /// ([scaleInertiaMaxExcursion] still bounds the excursion).
+  final double scaleGestureSensitivity;
 
   /// {@macro flutter.gestures.scale.trackpadScrollCausesScale}
   final bool trackpadScrollCausesScale;
@@ -905,7 +959,14 @@ class InteractiveViewerState extends State<InteractiveViewer> with TickerProvide
         // details.scale gives us the amount to change the scale as of the
         // start of this gesture, so calculate the amount to scale as of the
         // previous call to _onScaleUpdate.
-        final desiredScale = _scaleStart! * details.scale;
+        //
+        // scaleGestureSensitivity (default 1.0) raises the gesture ratio to a
+        // power so the same finger movement produces more zoom; 1.0 leaves the
+        // value exactly as upstream.
+        final gestureScale = widget.scaleGestureSensitivity == 1.0
+            ? details.scale
+            : math.pow(details.scale, widget.scaleGestureSensitivity).toDouble();
+        final desiredScale = _scaleStart! * gestureScale;
         final scaleChange = desiredScale / scale;
         _snapFocalPoint = details.localFocalPoint;
         _transformer.value = _matrixScale(_transformer.value, scaleChange);
@@ -1087,9 +1148,16 @@ class InteractiveViewerState extends State<InteractiveViewer> with TickerProvide
             widget.interactionEndFrictionCoefficient,
             effectivelyMotionless: 0.1,
           );
+          final flingTarget = boundedScaleFlingTarget(
+            releaseScale: scale,
+            rawTarget: frictionSimulation.x(tFinal),
+            maxExcursion: widget.scaleInertiaMaxExcursion,
+            minScale: widget.minScale,
+            maxScale: widget.maxScale,
+          );
           _scaleAnimation = Tween<double>(
             begin: scale,
-            end: frictionSimulation.x(tFinal),
+            end: flingTarget,
           ).animate(CurvedAnimation(parent: _scaleController, curve: Curves.decelerate));
           _scaleController.duration = Duration(milliseconds: (tFinal * 1000).round());
           _scaleAnimation!.addListener(_handleScaleAnimation);

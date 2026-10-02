@@ -55,6 +55,8 @@ class PdfViewerParams {
     this.panEnabled = true,
     this.scaleEnabled = true,
     this.scaleInertiaEnabled = true,
+    this.scaleInertiaMaxExcursion,
+    this.scaleGestureSensitivity = 1.0,
     this.onInteractionEnd,
     this.onInteractionStart,
     this.onInteractionUpdate,
@@ -307,6 +309,16 @@ class PdfViewerParams {
   /// an unbounded fling target can produce on a fast pinch.
   /// Pan inertia is not affected.
   final bool scaleInertiaEnabled;
+
+  /// The maximum post-release scale-inertia excursion, as a fraction of the
+  /// release scale; see the `InteractiveViewer.scaleInertiaMaxExcursion`
+  /// documentation for details. `null` preserves the unbounded behaviour.
+  final double? scaleInertiaMaxExcursion;
+
+  /// Sensitivity of the pinch/scale gesture, applied as an exponent to the
+  /// gesture's scale ratio; see the `InteractiveViewer.scaleGestureSensitivity`
+  /// documentation for details. `1.0` preserves the default behaviour.
+  final double scaleGestureSensitivity;
 
   /// See [InteractiveViewer.onInteractionEnd] for details.
   final GestureScaleEndCallback? onInteractionEnd;
@@ -797,6 +809,8 @@ class PdfViewerParams {
         other.panEnabled == panEnabled &&
         other.scaleEnabled == scaleEnabled &&
         other.scaleInertiaEnabled == scaleInertiaEnabled &&
+        other.scaleInertiaMaxExcursion == scaleInertiaMaxExcursion &&
+        other.scaleGestureSensitivity == scaleGestureSensitivity &&
         other.onInteractionEnd == onInteractionEnd &&
         other.onInteractionStart == onInteractionStart &&
         other.onInteractionUpdate == onInteractionUpdate &&
@@ -869,6 +883,8 @@ class PdfViewerParams {
         panEnabled.hashCode ^
         scaleEnabled.hashCode ^
         scaleInertiaEnabled.hashCode ^
+        scaleInertiaMaxExcursion.hashCode ^
+        scaleGestureSensitivity.hashCode ^
         onInteractionEnd.hashCode ^
         onInteractionStart.hashCode ^
         onInteractionUpdate.hashCode ^

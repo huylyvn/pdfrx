@@ -630,6 +630,8 @@ class _PdfViewerState extends State<PdfViewer>
                             panEnabled: widget.params.panEnabled,
                             scaleEnabled: widget.params.scaleEnabled,
                             scaleInertiaEnabled: widget.params.scaleInertiaEnabled,
+                            scaleInertiaMaxExcursion: widget.params.scaleInertiaMaxExcursion,
+                            scaleGestureSensitivity: widget.params.scaleGestureSensitivity,
                             onInteractionEnd: _onInteractionEnd,
                             onInteractionStart: _onInteractionStart,
                             onInteractionUpdate: widget.params.onInteractionUpdate,
