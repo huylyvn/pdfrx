@@ -25,6 +25,7 @@ import 'internals/widget_size_sniffer.dart';
 import 'pdf_page_links_overlay.dart';
 import 'pdf_viewer_layout_metrics.dart';
 import 'pdf_viewer_params.dart';
+import 'pdf_viewer_render_readiness.dart';
 import 'scroll_interaction/pdf_viewer_scroll_interaction_delegate.dart';
 import 'sizing/pdf_viewer_size_delegate.dart';
 import 'zoom_steps/pdf_viewer_zoom_steps_delegate.dart';
@@ -371,6 +372,7 @@ class _PdfViewerState extends State<PdfViewer>
     if (widget == oldWidget) {
       return;
     }
+    _bumpRenderEpoch();
 
     if (oldWidget?.documentRef.key == widget.documentRef.key) {
       if (widget.params.doChangesRequireReload(oldWidget?.params)) {
@@ -405,6 +407,8 @@ class _PdfViewerState extends State<PdfViewer>
     final currentDoc = widget.documentRef.resolveListenable().document;
     if (currentDoc != null && currentDoc == _document) return;
 
+    _bumpRenderEpoch();
+    _lastPaintedFrame = null;
     _layout = null;
     _documentSubscription?.cancel();
     _documentSubscription = null;
@@ -503,7 +507,10 @@ class _PdfViewerState extends State<PdfViewer>
 
   void _onSemanticsEnabledChanged() => _invalidate();
 
-  void _onMatrixChanged() => _invalidate();
+  void _onMatrixChanged() {
+    _bumpRenderEpoch();
+    _invalidate();
+  }
 
   void _updateFontManagerAssociation() {
     final fontManager = widget.fontManager;
@@ -534,6 +541,7 @@ class _PdfViewerState extends State<PdfViewer>
   void _onDocumentEvent(PdfDocumentEvent event) {
     if (event is PdfDocumentPageStatusChangedEvent) {
       // FIXME: We can handle the event more efficiently by only updating the affected pages.
+      _bumpRenderEpoch();
       for (final change in event.changes.entries) {
         _imageCache.makeCacheImageForPageDirty(change.key);
         _magnifierImageCache.makeCacheImageForPageDirty(change.key);
@@ -774,6 +782,7 @@ class _PdfViewerState extends State<PdfViewer>
     final isViewSizeChanged = oldSize != viewSize;
     _viewSize = viewSize;
     final isLayoutChanged = _relayoutPages();
+    if (isViewSizeChanged || isLayoutChanged) _bumpRenderEpoch();
 
     _recalculateMetrics();
     _calcZoomStopTable();
@@ -1475,6 +1484,7 @@ class _PdfViewerState extends State<PdfViewer>
   /// [_CustomPainter] calls the function to paint PDF pages.
   void _paintPages(ui.Canvas canvas, ui.Size size) {
     if (!_initialized) return;
+    final paintedPages = <_PaintedPage>[];
     _paintPagesCustom(
       canvas,
       cache: _imageCache,
@@ -1484,6 +1494,126 @@ class _PdfViewerState extends State<PdfViewer>
       scale: _currentZoom * MediaQuery.of(context).devicePixelRatio,
       enableLowResolutionPagePreview: widget.params.behaviorControlParams.enableLowResolutionPagePreview,
       filterQuality: FilterQuality.low,
+      paintedPages: paintedPages,
+    );
+    _lastPaintedFrame = _PaintedFrame(
+      pages: paintedPages,
+      notFinalAtPaint: _pagesNotFinalNow(paintedPages),
+      epoch: _renderEpoch,
+      document: _document,
+      zoom: _currentZoom,
+      devicePixelRatio: MediaQuery.of(context).devicePixelRatio,
+      viewSize: _viewSize!,
+      visibleRect: _visibleRect,
+    );
+    _scheduleRenderStatePublish();
+  }
+
+  // ---- render readiness ------------------------------------------------------------------------------------------
+
+  /// Increased whenever the context that a render state was evaluated for may have changed.
+  int _renderEpoch = 0;
+  _PaintedFrame? _lastPaintedFrame;
+  bool _renderPublishScheduled = false;
+
+  void _bumpRenderEpoch() => _renderEpoch++;
+
+  /// Publishes the render state after the current frame (never from inside build/paint).
+  void _scheduleRenderStatePublish({bool forceFrame = false}) {
+    if (!mounted) return;
+    if (!_renderPublishScheduled) {
+      _renderPublishScheduled = true;
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        _renderPublishScheduled = false;
+        _publishRenderState();
+      });
+    }
+    if (forceFrame) WidgetsBinding.instance.scheduleFrame();
+  }
+
+  void _publishRenderState() {
+    if (!mounted) return;
+    _controller?._publishRenderState(_evaluateRenderState());
+  }
+
+  /// Status of every page in [pages] against the image caches as they are right now.
+  PdfPageRenderStatus _pageStatusNow(_PaintedPage p, PdfDocument document) {
+    final preview = _imageCache.pageImages[p.pageNumber];
+    final partial = _imageCache.pageImagesPartial[p.pageNumber];
+    return evaluatePageRenderStatus(
+      pageLoaded: document.pages[p.pageNumber - 1].isLoaded,
+      previewEnabled: p.previewEnabled,
+      previewScaleLimit: p.previewScaleLimit,
+      pageScale: p.pageScale,
+      requiredRect: p.requiredRect,
+      previewScale: preview?.scale,
+      previewDirty: preview?.isDirty ?? false,
+      previewFailed: _imageCache.failedPreviewScale[p.pageNumber] == p.previewScaleLimit,
+      previewPending:
+          _imageCache.previewInFlight.contains(p.pageNumber) ||
+          (_imageCache.pageImageRenderingTimers[p.pageNumber]?.isActive ?? false),
+      partialScale: partial?.scale,
+      partialRect: partial?.rect,
+      partialDirty: partial?.isDirty ?? false,
+      partialPending: _imageCache.pageImagePartialRenderingRequests.containsKey(p.pageNumber),
+      partialFailed: _imageCache.failedPartialScale[p.pageNumber] == p.pageScale,
+      partialPossible: p.partialPossible,
+    );
+  }
+
+  /// Visible pages of a frame that is being painted whose images are not final right now (called at paint time).
+  List<int> _pagesNotFinalNow(List<_PaintedPage> pages) {
+    final document = _document;
+    if (document == null) return [for (final p in pages) p.pageNumber];
+    return [
+      for (final p in pages)
+        if (p.pageNumber < 1 ||
+            p.pageNumber > document.pages.length ||
+            _pageStatusNow(p, document) != PdfPageRenderStatus.ready)
+          p.pageNumber,
+    ];
+  }
+
+  /// The render state of the last painted frame.
+  ///
+  /// A frame is "ready" if everything it drew came from final images, i.e. [_PaintedFrame.notFinalAtPaint] is empty.
+  /// Images that arrive after the frame was painted do not make that frame ready (its pixels are already drawn);
+  /// they trigger a repaint, and the new frame is evaluated at its own paint time. Rendering failures that happen
+  /// after the paint are overlaid, because they make readiness unreachable without changing any pixel.
+  PdfViewerRenderState _evaluateRenderState() {
+    final frame = _lastPaintedFrame;
+    final document = _document;
+    if (frame == null ||
+        document == null ||
+        _layout == null ||
+        _viewSize == null ||
+        !_initialized ||
+        frame.epoch != _renderEpoch ||
+        !identical(frame.document, document)) {
+      return PdfViewerRenderState.notReady(generation: _renderEpoch);
+    }
+    final visible = <int>[for (final p in frame.pages) p.pageNumber];
+    final failed = <int>[];
+    for (final p in frame.pages) {
+      if (p.pageNumber < 1 || p.pageNumber > document.pages.length) {
+        return PdfViewerRenderState.notReady(generation: _renderEpoch);
+      }
+      if (_pageStatusNow(p, document) == PdfPageRenderStatus.failed) failed.add(p.pageNumber);
+    }
+    final pending = [
+      for (final n in frame.notFinalAtPaint)
+        if (!failed.contains(n)) n,
+    ];
+    return PdfViewerRenderState(
+      isReady: visible.isNotEmpty && pending.isEmpty && failed.isEmpty,
+      generation: frame.epoch,
+      visiblePageNumbers: visible,
+      pendingPageNumbers: pending,
+      failedPageNumbers: failed,
+      zoom: frame.zoom,
+      devicePixelRatio: frame.devicePixelRatio,
+      viewSize: frame.viewSize,
+      visibleRect: frame.visibleRect,
     );
   }
 
@@ -1496,6 +1626,7 @@ class _PdfViewerState extends State<PdfViewer>
     Rect? cacheTargetRect,
     bool enableLowResolutionPagePreview = true,
     FilterQuality filterQuality = FilterQuality.high,
+    List<_PaintedPage>? paintedPages,
   }) {
     final unusedPageList = <int>[];
     final dropShadowPaint = widget.params.pageDropShadow?.toPaint()?..style = PaintingStyle.fill;
@@ -1569,6 +1700,26 @@ class _PdfViewerState extends State<PdfViewer>
       }
 
       final pageScale = scale * max(rect.width / page.width, rect.height / page.height);
+      if (paintedPages != null) {
+        final visibleRegion = rect.intersect(targetRect);
+        if (!visibleRegion.isEmpty) {
+          paintedPages.add(
+            _PaintedPage(
+              pageNumber: page.pageNumber,
+              pageScale: pageScale,
+              previewScaleLimit: previewScaleLimit,
+              requiredRect: visibleRegion,
+              previewEnabled: enableLowResolutionPagePreview,
+              // Mirrors the guards of _requestRealSizePartialImage/_createRealSizePartialImage.
+              partialPossible:
+                  visibleRegion.width >= 1 &&
+                  visibleRegion.height >= 1 &&
+                  (visibleRegion.width * pageScale).toInt() >= 1 &&
+                  (visibleRegion.height * pageScale).toInt() >= 1,
+            ),
+          );
+        }
+      }
       if (!enableLowResolutionPagePreview || pageScale > previewScaleLimit) {
         _requestRealSizePartialImage(cache, page, pageScale, targetRect);
       }
@@ -1729,10 +1880,12 @@ class _PdfViewerState extends State<PdfViewer>
     final cancellationToken = page.createCancellationToken();
 
     cache.addCancellationToken(page.pageNumber, cancellationToken);
+    cache.previewInFlight.add(page.pageNumber);
     await cache.synchronized(() async {
       if (!mounted || cancellationToken.isCanceled) return;
       final prev = cache.pageImages[page.pageNumber];
       if (prev != null && !prev.isDirty && prev.scale == scale) return;
+      cache.failedPreviewScale.remove(page.pageNumber); // a new attempt supersedes an older failure
       PdfImage? img;
       try {
         img = await page.render(
@@ -1748,13 +1901,16 @@ class _PdfViewerState extends State<PdfViewer>
         final newImage = _PdfImageWithScale(await img.createImage(), scale);
         cache.pageImages[page.pageNumber]?.dispose();
         cache.pageImages[page.pageNumber] = newImage;
+        cache.failedPreviewScale.remove(page.pageNumber);
         _invalidate();
       } catch (e) {
+        cache.failedPreviewScale[page.pageNumber] = scale;
+        if (identical(cache, _imageCache)) _scheduleRenderStatePublish(forceFrame: true);
         return; // ignore error
       } finally {
         img?.dispose();
       }
-    });
+    }).whenComplete(() => cache.previewInFlight.remove(page.pageNumber));
   }
 
   Future<void> _requestRealSizePartialImage(
@@ -1782,6 +1938,7 @@ class _PdfViewerState extends State<PdfViewer>
           if (newImage != null && cache.pageImagePartialRenderingRequests[page.pageNumber] == request) {
             cache.pageImagesPartial.remove(page.pageNumber)?.dispose();
             cache.pageImagesPartial[page.pageNumber] = newImage;
+            cache.failedPartialScale.remove(page.pageNumber);
             _invalidate();
           } else {
             newImage?.dispose();
@@ -1794,6 +1951,7 @@ class _PdfViewerState extends State<PdfViewer>
       }),
       cancellationToken,
     );
+    cache.failedPartialScale.remove(page.pageNumber); // a new attempt supersedes an older failure
     cache.pageImagePartialRenderingRequests[page.pageNumber] = request;
   }
 
@@ -1833,6 +1991,8 @@ class _PdfViewerState extends State<PdfViewer>
       if (img == null || !mounted || cancellationToken.isCanceled) return null;
       return _PdfImageWithScaleAndRect(await img.createImage(), scale, rect, x, y);
     } catch (e) {
+      cache.failedPartialScale[page.pageNumber] = scale;
+      if (identical(cache, _imageCache)) _scheduleRenderStatePublish(forceFrame: true);
       return null; // ignore error
     } finally {
       img?.dispose();
@@ -2192,6 +2352,8 @@ class _PdfViewerState extends State<PdfViewer>
     // Clear any cached partial images to avoid stale tiles after
     // going to the new matrix
     _imageCache.releasePartialImages();
+    _bumpRenderEpoch();
+    _invalidate();
 
     zoom = zoom ?? _currentZoom;
     final tx = -documentOffset.dx * zoom;
@@ -3623,6 +3785,7 @@ class _PdfViewerState extends State<PdfViewer>
   PdfViewerCoordinateConverter get doc2local => this;
 
   void forceRepaintAllPageImages() {
+    _bumpRenderEpoch();
     _imageCache.cancelAllPendingRenderings();
     _magnifierImageCache.cancelAllPendingRenderings();
     _imageCache.releaseAllImages();
@@ -3637,6 +3800,13 @@ class _PdfPageImageCache {
   final pageImagesPartial = <int, _PdfImageWithScaleAndRect>{};
   final cancellationTokens = <int, List<PdfPageRenderCancellationToken>>{};
   final pageImagePartialRenderingRequests = <int, _PdfPartialImageRenderingRequest>{};
+
+  /// Scale of the last failed preview/partial rendering attempt per page (cleared by a later success).
+  final failedPreviewScale = <int, double>{};
+  final failedPartialScale = <int, double>{};
+
+  /// Pages whose preview rendering is currently in flight (queued on the cache's lock or rendering).
+  final previewInFlight = <int>{};
 
   void addCancellationToken(int pageNumber, PdfPageRenderCancellationToken token) {
     var tokens = cancellationTokens.putIfAbsent(pageNumber, () => []);
@@ -3671,6 +3841,8 @@ class _PdfPageImageCache {
       image.image.dispose();
     }
     pageImagesPartial.clear();
+    failedPreviewScale.clear();
+    failedPartialScale.clear();
   }
 
   void cancelPendingRenderings(int pageNumber) {
@@ -3709,6 +3881,8 @@ class _PdfPageImageCache {
       removed.image.dispose();
     }
     pageImagesPartial.remove(pageNumber)?.dispose();
+    failedPreviewScale.remove(pageNumber);
+    failedPartialScale.remove(pageNumber);
   }
 
   void removeCacheImagesIfCacheBytesExceedsLimit(
@@ -3738,6 +3912,49 @@ class _PdfPageImageCache {
       }
     }
   }
+}
+
+/// What one painted frame required of the page raster for a visible page.
+class _PaintedPage {
+  const _PaintedPage({
+    required this.pageNumber,
+    required this.pageScale,
+    required this.previewScaleLimit,
+    required this.requiredRect,
+    required this.previewEnabled,
+    required this.partialPossible,
+  });
+  final int pageNumber;
+  final double pageScale;
+  final double previewScaleLimit;
+  final Rect requiredRect;
+  final bool previewEnabled;
+  final bool partialPossible;
+}
+
+/// The context of the last painted main-view frame.
+class _PaintedFrame {
+  const _PaintedFrame({
+    required this.pages,
+    required this.notFinalAtPaint,
+    required this.epoch,
+    required this.document,
+    required this.zoom,
+    required this.devicePixelRatio,
+    required this.viewSize,
+    required this.visibleRect,
+  });
+  final List<_PaintedPage> pages;
+
+  /// Visible pages whose raster was missing/stale/incomplete at the moment this frame was painted. Readiness is a
+  /// property of what the frame drew, so it is captured at paint time, not re-derived from later cache contents.
+  final List<int> notFinalAtPaint;
+  final int epoch;
+  final PdfDocument? document;
+  final double zoom;
+  final double devicePixelRatio;
+  final Size viewSize;
+  final Rect visibleRect;
 }
 
 class _PdfPartialImageRenderingRequest {
@@ -4019,13 +4236,97 @@ class PdfViewerController extends ValueListenable<Matrix4> {
   final _listeners = <VoidCallback>[];
 
   void _attach(_PdfViewerState? state) {
+    final previous = __state;
     __state?._txController.removeListener(_notifyListeners);
     __state = state;
     __state?._txController.addListener(_notifyListeners);
+    if (previous != null && !identical(previous, state)) {
+      // The viewer/document this controller was attached to is gone: nothing that was ready can be ready anymore.
+      _renderStateNotifier.value = PdfViewerRenderState.notReady(generation: _renderStateNotifier.value.generation + 1);
+      for (final waiter in List.of(_detachWaiters)) {
+        waiter();
+      }
+    }
+  }
+
+  final _renderStateNotifier = ValueNotifier<PdfViewerRenderState>(const PdfViewerRenderState.notReady());
+  final _detachWaiters = <VoidCallback>[];
+
+  void _publishRenderState(PdfViewerRenderState state) {
+    if (_renderStateNotifier.value != state) _renderStateNotifier.value = state;
+  }
+
+  /// Notifications about the raster rendering state of the viewer; see [PdfViewerRenderState].
+  ///
+  /// Updates are published after the frame that caused them, so the value can still read ready for a moment after a
+  /// zoom/scroll/viewport/document change. Use it for notification only; to test readiness at a given moment use
+  /// [isRenderReady] (evaluated live) or [waitForRenderReady].
+  ValueListenable<PdfViewerRenderState> get renderState => _renderStateNotifier;
+
+  /// Whether the most recently painted frame was drawn entirely from final raster images, and nothing that could
+  /// change that (zoom, scroll, viewport, document, page content) has changed since.
+  ///
+  /// Only PDF page rasters are covered; application-drawn overlays are not.
+  bool get isRenderReady => __state?._evaluateRenderState().isReady ?? false;
+
+  /// Completes when [isRenderReady] becomes true and returns the ready [PdfViewerRenderState].
+  ///
+  /// Throws [PdfRenderReadyException] with [PdfRenderReadyFailure.timeout] if [timeout] elapses,
+  /// [PdfRenderReadyFailure.renderFailed] if rendering of a visible page failed, or
+  /// [PdfRenderReadyFailure.detached] if the viewer is disposed or its document is replaced while waiting
+  /// (or if no viewer is attached).
+  Future<PdfViewerRenderState> waitForRenderReady({Duration timeout = const Duration(seconds: 30)}) {
+    final completer = Completer<PdfViewerRenderState>();
+    Timer? timer;
+    late final VoidCallback check;
+    late final VoidCallback onDetach;
+
+    void finish(Object? error, PdfViewerRenderState? ok) {
+      if (completer.isCompleted) return;
+      timer?.cancel();
+      _renderStateNotifier.removeListener(check);
+      removeListener(check);
+      _detachWaiters.remove(onDetach);
+      if (error != null) {
+        completer.completeError(error);
+      } else {
+        completer.complete(ok);
+      }
+    }
+
+    onDetach = () => finish(PdfRenderReadyException(PdfRenderReadyFailure.detached, _renderStateNotifier.value), null);
+    check = () {
+      if (completer.isCompleted) return;
+      final state = __state;
+      if (state == null) {
+        onDetach();
+        return;
+      }
+      final live = state._evaluateRenderState();
+      if (live.isReady) {
+        finish(null, live);
+      } else if (live.hasFailures) {
+        finish(PdfRenderReadyException(PdfRenderReadyFailure.renderFailed, live), null);
+      }
+    };
+
+    check();
+    if (completer.isCompleted) return completer.future;
+    _renderStateNotifier.addListener(check);
+    addListener(check);
+    _detachWaiters.add(onDetach);
+    timer = Timer(timeout, () {
+      finish(PdfRenderReadyException(PdfRenderReadyFailure.timeout, _renderStateNotifier.value), null);
+    });
+    __state?._scheduleRenderStatePublish(forceFrame: true);
+    return completer.future;
   }
 
   void _notifyListeners() {
-    for (final listener in _listeners) {
+    // Invalidate render readiness before anyone (e.g. a waitForRenderReady waiter) observes the change, and iterate a
+    // copy because waiters remove their listener while being notified.
+    __state?._bumpRenderEpoch();
+    for (final listener in List.of(_listeners)) {
       listener();
     }
   }

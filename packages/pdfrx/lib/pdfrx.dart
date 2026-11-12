@@ -8,6 +8,7 @@ export 'src/widgets/pdf_text_searcher.dart';
 export 'src/widgets/pdf_viewer.dart';
 export 'src/widgets/pdf_viewer_layout_metrics.dart';
 export 'src/widgets/pdf_viewer_params.dart';
+export 'src/widgets/pdf_viewer_render_readiness.dart';
 export 'src/widgets/pdf_viewer_scroll_thumb.dart';
 export 'src/widgets/pdf_widgets.dart';
 export 'src/widgets/scroll_interaction/pdf_viewer_scroll_interaction_delegate.dart';
